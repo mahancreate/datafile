@@ -145,7 +145,7 @@ jobs:
                         Name="datafile.exe"
                         KeyPath="yes" />
                 </Component>
-                <Component Id="PathEnvVar" Guid="*">
+                <Component Id="PathEnvVar" Guid="{A5A949C0-6B78-4781-BEF1-C9A9EDAF8F14}">
                   <Environment Id="PATH"
                                Name="PATH"
                                Value="[INSTALLFOLDER]"
