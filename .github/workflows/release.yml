@@ -1,0 +1,206 @@
+name: Build & Release
+
+on:
+  push:
+    paths:
+      - "datafile.py"
+      - "version.ver"
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Read version ────────────────────────────────────────────────────
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Get-Content version.ver -Raw).Trim()
+          echo "VERSION=$v" >> $env:GITHUB_OUTPUT
+          echo "TAG=v$v"    >> $env:GITHUB_OUTPUT
+
+      # ── 3. Python setup ────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          pip install argon2-cffi cryptography pyinstaller
+
+      # ── 4. Build portable .exe with PyInstaller (used by both installers) ──
+      - name: Build portable EXE
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --onefile `
+            --console `
+            --name datafile `
+            --distpath dist `
+            datafile.py
+
+      # ── 5. Build setup-exe with Inno Setup ────────────────────────────────
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --yes --no-progress
+
+      - name: Write Inno Setup script
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.ver.outputs.VERSION }}"
+          $iss = @"
+          [Setup]
+          AppName=DataFile
+          AppVersion=$ver
+          AppPublisher=DataFile
+          DefaultDirName={autopf}\DataFile
+          DefaultGroupName=DataFile
+          OutputDir=dist
+          OutputBaseFilename=datafile-$ver-setup
+          Compression=lzma2/ultra64
+          SolidCompression=yes
+          ChangesEnvironment=yes
+          PrivilegesRequired=admin
+
+          [Files]
+          Source: "dist\datafile.exe"; DestDir: "{app}"; Flags: ignoreversion
+
+          [Registry]
+          Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; \
+            ValueType: expandsz; ValueName: "Path"; \
+            ValueData: "{olddata};{app}"; \
+            Check: NeedsAddPath(ExpandConstant('{app}'))
+
+          [Code]
+          function NeedsAddPath(Param: string): boolean;
+          var
+            OrigPath: string;
+          begin
+            if not RegQueryStringValue(HKEY_LOCAL_MACHINE,
+              'SYSTEM\CurrentControlSet\Control\Session Manager\Environment',
+              'Path', OrigPath)
+            then begin
+              Result := True;
+              exit;
+            end;
+            Result := Pos(';' + Param + ';', ';' + OrigPath + ';') = 0;
+          end;
+
+          [Icons]
+          Name: "{group}\Uninstall DataFile"; Filename: "{uninstallexe}"
+          "@
+
+          $iss | Out-File -FilePath datafile.iss -Encoding UTF8
+
+      - name: Build setup EXE
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" datafile.iss
+
+      # ── 6. Install WiX Toolset ─────────────────────────────────────────────
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 4.0.5
+
+      # ── 7. Write WiX source ────────────────────────────────────────────────
+      - name: Write WiX source
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.ver.outputs.VERSION }}"
+          $parts = $ver.Split('.')
+          while ($parts.Count -lt 4) { $parts += '0' }
+          $wixVer = $parts[0..3] -join '.'
+
+          $wxs = @"
+          <?xml version="1.0" encoding="UTF-8"?>
+          <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+            <Package
+              Name="DataFile"
+              Version="$wixVer"
+              Manufacturer="DataFile"
+              UpgradeCode="4A3B2C1D-0000-0000-0000-000000000001"
+              InstallerVersion="500"
+              Scope="perMachine">
+
+              <MajorUpgrade DowngradeErrorMessage="A newer version is already installed." />
+              <MediaTemplate EmbedCab="yes" />
+
+              <Feature Id="Main" Title="DataFile" Level="1">
+                <ComponentGroupRef Id="MainComponents" />
+              </Feature>
+
+              <ComponentGroup Id="MainComponents" Directory="INSTALLFOLDER">
+                <Component Id="MainExe" Guid="*">
+                  <File Id="DatafileExe"
+                        Source="dist\datafile.exe"
+                        Name="datafile.exe"
+                        KeyPath="yes" />
+                </Component>
+                <Component Id="PathEnvVar" Guid="*">
+                  <Environment Id="PATH"
+                               Name="PATH"
+                               Value="[INSTALLFOLDER]"
+                               Permanent="no"
+                               Part="last"
+                               Action="set"
+                               System="yes" />
+                </Component>
+              </ComponentGroup>
+
+              <StandardDirectory Id="ProgramFiles6432Folder">
+                <Directory Id="INSTALLFOLDER" Name="DataFile" />
+              </StandardDirectory>
+
+            </Package>
+          </Wix>
+          "@
+
+          $wxs | Out-File -FilePath datafile.wxs -Encoding UTF8
+
+      # ── 8. Build .msi ──────────────────────────────────────────────────────
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          wix build datafile.wxs -o dist\datafile.msi
+
+      # ── 9. Rename artifacts with version ───────────────────────────────────
+      - name: Rename artifacts
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.VERSION }}"
+          Rename-Item "dist\datafile-$v-setup.exe" "datafile-$v-setup.exe"
+          Rename-Item "dist\datafile.msi"           "datafile-$v.msi"
+
+      # ── 10. Create GitHub release ──────────────────────────────────────────
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.TAG }}
+          name: DataFile ${{ steps.ver.outputs.VERSION }}
+          body: |
+            ## DataFile ${{ steps.ver.outputs.VERSION }}
+
+            ### Installers
+            | File | Format | Notes |
+            |------|--------|-------|
+            | `datafile-${{ steps.ver.outputs.VERSION }}-setup.exe` | Inno Setup | Classic setup wizard, adds to PATH |
+            | `datafile-${{ steps.ver.outputs.VERSION }}.msi` | MSI / WiX | For enterprise / group policy deployment |
+
+            ### Requirements
+            No Python required — all dependencies are bundled.
+          files: |
+            dist/datafile-${{ steps.ver.outputs.VERSION }}-setup.exe
+            dist/datafile-${{ steps.ver.outputs.VERSION }}.msi
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
